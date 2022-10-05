@@ -16,6 +16,7 @@ package startup
 import (
 	"context"
 	cryptorand "crypto/rand"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -25,15 +26,15 @@ import (
 	"strings"
 	"time"
 
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"github.com/projectcalico/api/pkg/lib/numorstring"
 	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-	"github.com/projectcalico/api/pkg/lib/numorstring"
+	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	libapi "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
@@ -143,42 +144,40 @@ func Run() {
 			return
 		}
 
-		// Check if we're running on a kubeadm and/or rancher cluster. Any error other than not finding the respective
-		// config map should be serious enough that we ought to stop here and return.
-		kubeadmConfig, err = clientset.CoreV1().ConfigMaps(metav1.NamespaceSystem).Get(ctx,
-			KubeadmConfigConfigMap,
-			metav1.GetOptions{})
+		kubeadmConfig, rancherState, k8sNode, err = fetchK8sConfig(ctx, clientset, k8sNodeName)
 		if err != nil {
-			if kerrors.IsNotFound(err) {
-				kubeadmConfig = nil
-			} else if kerrors.IsUnauthorized(err) {
-				kubeadmConfig = nil
-				log.WithError(err).Info("Unauthorized to query kubeadm configmap, assuming not on kubeadm. CIDR detection will not occur.")
-			} else {
-				log.WithError(err).Error("failed to query kubeadm's config map")
-				utils.Terminate()
-			}
-		}
+			if errors.Is(err, retryWithExtClientsetErr) {
+				kubeconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+					clientcmd.NewDefaultClientConfigLoadingRules(),
+					&clientcmd.ConfigOverrides{},
+				)
+				config, err := kubeconfig.ClientConfig()
+				if err != nil {
+					log.WithError(err).Error("Failed to create client config")
+					utils.Terminate()
+					return
+				}
+				config.Timeout = 2 * time.Second
 
-		rancherState, err = clientset.CoreV1().ConfigMaps(metav1.NamespaceSystem).Get(ctx,
-			RancherStateConfigMap,
-			metav1.GetOptions{})
-		if err != nil {
-			if kerrors.IsNotFound(err) {
-				rancherState = nil
-			} else if kerrors.IsUnauthorized(err) {
-				kubeadmConfig = nil
-				log.WithError(err).Info("Unauthorized to query rancher configmap, assuming not on rancher. CIDR detection will not occur.")
-			} else {
-				log.WithError(err).Error("failed to query Rancher's cluster state config map")
-				utils.Terminate()
-			}
-		}
+				log.Infof("external config host: %s", config.Host)
 
-		k8sNode, err = clientset.CoreV1().Nodes().Get(ctx, k8sNodeName, metav1.GetOptions{})
-		if err != nil {
-			log.WithError(err).Error("Failed to read Node from datastore")
-			utils.Terminate()
+				clientset, err = kubernetes.NewForConfig(config)
+				if err != nil {
+					log.WithError(err).Error("Failed to create clientset")
+					utils.Terminate()
+					return
+				}
+				kubeadmConfig, rancherState, k8sNode, err = fetchK8sConfig(ctx, clientset, k8sNodeName)
+				if err != nil {
+					log.WithError(err).Error("terminating because fetchK8sConfig failed also via external config")
+					utils.Terminate()
+					return
+				}
+			} else {
+				log.WithError(err).Error("terminating because fetchK8sConfig failed")
+				utils.Terminate()
+				return
+			}
 		}
 	}
 
@@ -240,6 +239,50 @@ func Run() {
 		log.WithError(err).Errorf("Unable to remove shutdown timestamp file")
 		utils.Terminate()
 	}
+}
+
+var retryWithExtClientsetErr = errors.New("retry with external clientset")
+
+func fetchK8sConfig(ctx context.Context, clientset *kubernetes.Clientset, k8sNodeName string) (*v1.ConfigMap, *v1.ConfigMap, *v1.Node, error) {
+	var kubeadmConfig, rancherState *v1.ConfigMap
+	var err error
+	// Check if we're running on a kubeadm and/or rancher cluster. Any error other than not finding the respective
+	// config map should be serious enough that we ought to stop here and return.
+	kubeadmConfig, err = clientset.CoreV1().ConfigMaps(metav1.NamespaceSystem).Get(ctx,
+		KubeadmConfigConfigMap,
+		metav1.GetOptions{})
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			kubeadmConfig = nil
+		} else if kerrors.IsUnauthorized(err) {
+			kubeadmConfig = nil
+			log.WithError(err).Info("Unauthorized to query kubeadm configmap, assuming not on kubeadm. CIDR detection will not occur.")
+		} else {
+			log.WithError(err).Error("failed to query kubeadm's config map")
+			return nil, nil, nil, retryWithExtClientsetErr
+		}
+	}
+
+	rancherState, err = clientset.CoreV1().ConfigMaps(metav1.NamespaceSystem).Get(ctx,
+		RancherStateConfigMap,
+		metav1.GetOptions{})
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			rancherState = nil
+		} else if kerrors.IsUnauthorized(err) {
+			kubeadmConfig = nil
+			log.WithError(err).Info("Unauthorized to query rancher configmap, assuming not on rancher. CIDR detection will not occur.")
+		} else {
+			return nil, nil, nil, fmt.Errorf("failed to query Rancher's cluster state config map: %w", err)
+		}
+	}
+
+	k8sNode, err := clientset.CoreV1().Nodes().Get(ctx, k8sNodeName, metav1.GetOptions{})
+	if err != nil {
+		log.WithError(err).Error("Failed to read Node from datastore")
+		return nil, nil, nil, err
+	}
+	return kubeadmConfig, rancherState, k8sNode, nil
 }
 
 func getMonitorPollInterval() time.Duration {
